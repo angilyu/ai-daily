@@ -1,0 +1,383 @@
+# AI Daily
+
+A macOS news reader for engineers who follow AI, GPUs, and systems work.
+
+It pulls from 45 RSS feeds, extracts the full article text so you can read it
+without leaving the app, generates a short summary at the top of each piece, and
+lets you define your own channels by describing what you want in plain English.
+
+Written in SwiftUI. About 3,600 lines of Swift, no third-party dependencies, no
+API keys, and no server. Everything runs locally.
+
+---
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Architecture](#architecture)
+- [The readability extractor](#the-readability-extractor)
+- [The summarizer](#the-summarizer)
+- [Prompt-defined channels](#prompt-defined-channels)
+- [Topic classification](#topic-classification)
+- [Refresh scheduling](#refresh-scheduling)
+- [Sources](#sources)
+- [Building](#building)
+- [Known limitations](#known-limitations)
+
+---
+
+## What it does
+
+**Reads articles in-app.** RSS feeds usually ship a truncated teaser. The app
+fetches the linked page and runs a hand-written readability extractor over the
+raw HTML to recover the actual prose, then renders it as native SwiftUI text.
+
+**Summarizes before you commit to reading.** Every article gets up to three
+bullet points at the top, in a collapsible card. This is extractive — it ranks
+and selects the article's own sentences rather than generating new text — so it
+cannot hallucinate.
+
+**Filters by topic.** Each story is classified into one of six engineering
+buckets, shown as a badge and usable as a filter.
+
+**Channels you define by prompt.** Describe the news you want and the app
+compiles it into visible, editable keyword rules. See
+[Prompt-defined channels](#prompt-defined-channels).
+
+**Lives in the menu bar too.** A `MenuBarExtra` shows recent headlines, and both
+it and the main window drive the same reader.
+
+---
+
+## Architecture
+
+```
+Feed (URL)
+   │
+   ├─ FeedParser ──────────── RSS 2.0 / Atom → [NewsItem]
+   │                            title, link, summary, publishedAt, contentHTML
+   │
+   ├─ TopicClassifier ─────── keyword scoring → [Topic]
+   │
+   └─ NewsStore ───────────── dedupe, merge, retention, persistence
+        │
+        ├─ ArticleLoader ──── fetch page → ArticleExtractor → Article
+        │                                    └─ Summarizer → keyPoints
+        │
+        └─ ChannelMatcher ─── score items against compiled ChannelRules
+```
+
+Layering is strict: `Models` hold data, `Services` do work and own all the
+non-trivial logic, `Views` only display. Every service is a pure enum namespace
+or a plain struct with no UI dependency, which is what makes them testable by
+compiling them into standalone Swift harnesses (see [Testing](#testing)).
+
+`NewsStore` is the single `@MainActor @Observable` source of truth, injected
+through the SwiftUI environment. It persists to a JSON snapshot in the sandbox
+container. Parsing, extraction, and summarization all happen off the main
+thread.
+
+### Data model
+
+| Type | Role |
+| --- | --- |
+| `Feed` | A source. Name, URL, enabled flag, built-in flag. |
+| `NewsItem` | One story. Stable ID derived from its link, plus topics. |
+| `Article` | Extracted full text as `[ArticleBlock]` plus `keyPoints`. |
+| `Topic` | Six-case enum used for badges and filtering. |
+| `Channel` | A user prompt plus the `ChannelRules` it compiled into. |
+
+### Storage
+
+A single JSON file under the app's sandbox container holds feeds, items, read
+IDs, channels, and the last refresh timestamp. Items are pruned on every refresh
+to a 14-day window, capped at 700 (the 41 enabled sources produce roughly 430 in
+a fortnight, so the cap is headroom rather than a limit).
+
+The snapshot's `channels` field is optional so that stores written before the
+channel feature still decode. Feed migration rebuilds the list from the current
+built-in set on every launch, which drops retired sources while preserving the
+user's enable/disable choices and any feeds they added themselves.
+
+---
+
+## The readability extractor
+
+`ArticleExtractor.swift` is the largest and most-debugged file in the project
+(~500 lines). It takes raw HTML and returns ordered blocks of prose. It is a
+scoring extractor in the Readability tradition, written from scratch — no
+`WKWebView`, no JavaScript, no dependencies.
+
+The approach: tokenize HTML into a tag stream, build a shallow tree, score
+candidate containers by text density and paragraph count, pick a winner, then
+clean it.
+
+`ArticleLoader` tries both the extracted page and any `content:encoded` from the
+feed, then picks whichever scores better. The score penalizes blobs with more
+than 250 words per block by half, because raw word count alone lets one
+unstructured wall of text beat properly structured prose.
+
+Getting from "works on my test page" to "works on 30 of 32 live articles" took a
+sequence of fixes against real, specific failures:
+
+| Problem | Fix |
+| --- | --- |
+| `<script>` bodies containing JSON corrupted the tag stack | Treat script/style as raw text with a dedicated scanner |
+| One site puts a junk class on `<body>`, skipping the whole document | Never apply junk-class filtering to structural tags |
+| Another marks real paragraphs `class="paywall"` | Only apply junk-class filtering to containers, never text blocks |
+| Restatement detection was deleting real prose | Require a title of 12+ normalized characters and lengths within 80% |
+| Pages using `<br>` instead of `<p>` produced nothing | Fall back to loose block detection gated on a prose heuristic |
+| A newsletter rendered 1,287 words as a single block | Treat a double `<br>` as a paragraph break |
+
+That prose heuristic — 12+ words, sentence punctuation, and under 50%
+capitalized words — is what keeps navigation menus and link lists out of the
+article body. The capitalization rule does most of the work.
+
+One source was removed permanently rather than fixed: Google News RSS links
+resolve to a redirect page and never reach the article.
+
+---
+
+## The summarizer
+
+`Summarizer.swift` ranks the article's own sentences and returns the best three.
+Extractive, not generative, so a summary can never contain a claim the article
+doesn't make.
+
+Sentences are scored on term frequency against the article's own vocabulary,
+position, title-word overlap, and length. Thresholds: at least 220 words before
+summarizing at all, at most 3 points, sentences between 9 and 45 words.
+
+The interesting part is sentence splitting, which is where almost all the bugs
+were:
+
+- **Abbreviations.** The token has to be captured *with* its trailing period,
+  otherwise `"Sept."` never matches the abbreviation list and a summary starts
+  mid-date.
+- **Quotations.** A lowercase-follower check has to apply to `!` and `?`, not
+  just `.`, or `"This is great!" she said.` splits inside the quote.
+- **Captions.** Text without terminal punctuation was becoming bullets.
+- **Transcripts.** Rhetorical questions and conversational filler scored well
+  and had to be explicitly down-weighted.
+
+The splitter has 14 unit tests, all passing (it started at 8 of 14).
+Performance: 4,000 paragraphs in 537ms. Summaries are computed off the main
+thread and cached with the article.
+
+---
+
+## Prompt-defined channels
+
+Describe what you want to read. The app compiles that description into keyword
+rules, shows you the rules, and lets you edit them. Stories matching a channel
+display the specific terms that matched instead of a topic badge.
+
+The design principle: **the prompt compiles into visible, editable rules.** No
+black box, and no situation where you cannot tell why something appeared.
+
+### Three layers
+
+**1. Keyword compiler** (`PromptCompiler.swift`) — always runs, instant,
+offline, deterministic.
+
+Parses quoted phrases, splits on clause boundaries so negation is scoped
+(`"gpus, but not gaming"` excludes only gaming), strips filler, keeps adjacent
+word pairs, and expands terms through a domain alias table — `gpu` brings in
+`cuda`, `blackwell`, `h100`, `vram`.
+
+Terms carry a weight: 3 if quoted, 2 if stated, 1 if expanded from an alias.
+Weights rank but never gate. A separate weak-term list demotes words like `ai`
+and `technology` to weight 1, since in a corpus where every story is about AI
+they carry almost no signal.
+
+**2. Scoring** (`ChannelMatcher.swift`) — ranks rather than hard-filters, so a
+channel degrades into "less relevant last" instead of an empty list. A title hit
+counts triple a summary hit. Matching is whole-word, so `ram` doesn't fire on
+`program`. Exclusions are the one hard rule, because "not X" is explicit.
+
+**3. On-device model** (`ModelPromptCompiler.swift`) — optional enhancement via
+Apple's `FoundationModels` framework. Free, private, offline. Weak-linked, so
+the app still builds and runs on macOS 14 and 15 and simply reports the model as
+unavailable.
+
+It runs **once per prompt edit**, never per story. Judging 200 stories
+individually was measured at roughly 500ms each, so the architecture uses the
+model to compile rules once and then matches instantly and deterministically
+forever after.
+
+### What the on-device model actually does, measured
+
+Two findings shaped the implementation.
+
+**Its exclusion lists are unsafe.** Across real prompts:
+
+| Prompt | Model's `exclude` output |
+| --- | --- |
+| `local llm inference on apple silicon` | `apple`, `silicon` |
+| `ai agents and tool use` | `ai`, `agent`, `tool` |
+| `new model releases from the big labs` | `model`, `releases` |
+
+Because exclusion is a hard filter, each of these silently empties the channel
+it was meant to define. **The model's exclusions are discarded entirely.**
+Negation is parsed deterministically from the prompt instead. The schema still
+*asks* for exclusions, because asking measurably improves the quality of the
+`include` list it returns.
+
+**It occasionally runs away.** Over 24 runs, 23 completed with a median of about
+600ms and a worst case of 1.1s. One looped until it exhausted the 4,096-token
+context window, taking 50 seconds. There is an 8-second deadline that falls back
+to keyword rules — well clear of any real response.
+
+Two smaller constraints, found earlier:
+
+- Forcing an array length with `@Guide(.count(n))` makes the model degenerate
+  into repeated filler. The schema requests unconstrained arrays and the alias
+  table does the broadening.
+- Refusals fire on ordinary technology headlines and are not reproducible
+  between runs. Every failure mode falls back rather than surfacing an error.
+
+Everything the model returns is filtered before use: terms are trimmed of
+bullets and quotes, dropped if longer than 40 characters or more than three
+words, and discarded if they duplicate what the keyword pass already found or
+consist only of stopwords.
+
+**Honest assessment:** across six test prompts the on-device model added between
+0 and 4 extra matches over the keyword compiler alone. Its clearest value is
+naming channels and contributing occasional vocabulary (`llms`, `chatbots`,
+`natural language processing`). A frontier cloud model would do this
+meaningfully better — and because all three layers emit the same
+`ChannelRules` format, adding one is a drop-in change rather than a rewrite.
+
+---
+
+## Topic classification
+
+`TopicClassifier` scores each story against keyword sets for six topics: Models,
+GPUs & Hardware, Research, Tools & Code, Infra & Systems, and Industry.
+Multi-word phrases score higher than single words, since they're stronger
+evidence.
+
+Two bugs here are worth recording, because both produced plausible-looking
+wrong output:
+
+- **Source bias was inventing topics.** A story about a company's revenue,
+  published by a hardware site, was tagged as hardware. Source bias now only
+  *reinforces* a topic the headline already suggests; it can never introduce
+  one.
+- **A score floor was discarding valid matches.** Single-keyword matches fell
+  through to a catch-all Industry bucket. The top-scoring topic now always
+  stands. A second topic is only added if it scores at least 4 *and* at least
+  75% of the winner.
+
+Measured across 200 live items: 0 unclassified, with reasonable spread.
+
+---
+
+## Refresh scheduling
+
+Refreshes hourly, plus whenever the Mac wakes.
+
+The scheduler compares the *age* of the data against a one-hour interval rather
+than counting down, because `Task.sleep` stops advancing while the machine
+sleeps. An `NSWorkspace.didWakeNotification` observer triggers a staleness check
+on wake.
+
+One bug worth noting: on a total fetch failure the last-refresh timestamp never
+updated, so the five-minute poll would retry forever while offline. A separate
+`lastAttempt` timestamp with a 10-minute floor fixes it. The logic also handles
+a clock jumping forward, where age computes as negative.
+
+The decision function `shouldRefresh(at:)` is pure and separated from the timer
+for exactly this reason. 11 scheduling tests, all passing.
+
+---
+
+## Sources
+
+45 feeds, 41 enabled by default, grouped by what they cover:
+
+- **Model releases** — OpenAI, Google DeepMind, Hugging Face, Mistral, Qwen,
+  Allen AI, The Decoder
+- **Silicon and hardware** — NVIDIA Developer, SemiAnalysis, Chips and Cheese,
+  The Next Platform, ServeTheHome, Phoronix, HPCwire
+- **Inference and tooling** — PyTorch, Ollama, Together AI, Replicate,
+  Databricks
+- **Platform engineering** — InfoQ, The Register, Cloudflare, Meta Engineering,
+  AWS ML, Netflix Tech, Fly.io
+- **Practitioners** — Simon Willison, Sebastian Raschka, Latent Space, Import
+  AI, Chip Huyen, Lilian Weng, Eugene Yan
+- **Research** — Google Research, Microsoft Research, Berkeley BAIR, arXiv
+- **News and community** — Hacker News, r/LocalLLaMA, TechCrunch, IEEE Spectrum,
+  MIT Technology Review
+
+Four ship disabled because of volume or fit: Tom's Hardware (~39 stories a day,
+much of it consumer gaming), Lobsters (general programming), and two arXiv
+categories. Toggle any of them in Settings, or add your own feed URL.
+
+Every source was verified to have a live feed *and* to render correctly in the
+in-app reader. Candidates that parsed but produced only terse changelogs or
+teaser text were rejected rather than shipped.
+
+---
+
+## Building
+
+Requires Xcode 26 or later and macOS 14 or later.
+
+```bash
+git clone https://github.com/angilyu/ai-daily.git
+cd ai-daily
+open AIDaily.xcodeproj
+```
+
+Then build and run (`⌘R`). Or from the command line:
+
+```bash
+xcodebuild -scheme AIDaily -configuration Debug \
+  -derivedDataPath build \
+  CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual build
+
+open build/Build/Products/Debug/AIDaily.app
+```
+
+The project targets macOS 14.0. `FoundationModels` is weak-linked and gated
+behind `#available(macOS 26.0, *)`, so on older systems the app runs normally
+and the model layer reports itself unavailable — the keyword compiler handles
+everything.
+
+The Xcode project uses `PBXFileSystemSynchronizedRootGroup` (object version 77),
+so files added to the `AIDaily` directory are picked up automatically without
+editing the project file.
+
+### Testing
+
+The services are deliberately free of UI dependencies, so they can be compiled
+into standalone Swift executables and run against real data — live feeds, real
+HTML, and the app's own persisted store. That's how the extractor, summarizer,
+classifier, scheduler, and prompt compiler were all validated: not against
+fixtures, but against the actual pages and headlines they'd see in production.
+
+---
+
+## Known limitations
+
+- **Bundle identifier is still `com.example.AIDaily`.** Change it before
+  distributing.
+- **No app icon.** The asset catalog slot is empty.
+- **Not on the App Store.** Shipping requires a paid Apple Developer Program
+  membership and a real signing identity.
+- **Two live articles in 32 aren't extractable** — JavaScript-rendered or
+  paywalled pages. These fall back to the feed summary with a link out.
+- **Slow blogs can go invisible.** Sources that post less than once a fortnight
+  fall outside the retention window entirely. Keeping each source's most recent
+  post regardless of age would fix this.
+- **Transcripts summarize poorly.** Extractive ranking assumes expository prose.
+- **A channel can only match what's already in your sources.** A prompt about a
+  topic none of the feeds cover compiles fine and matches nothing. The editor
+  says so explicitly rather than showing a blank list.
+
+---
+
+## License
+
+MIT
