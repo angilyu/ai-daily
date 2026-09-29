@@ -41,6 +41,25 @@ struct Article: Codable, Hashable {
     /// Short digest shown above the article. Empty when the piece is already
     /// brief enough that a summary would just repeat it.
     var keyPoints: [String] = []
+    /// One-line takeaway. Only Claude writes these; extraction can't compress.
+    var tldr: String?
+    var whyItMatters: String?
+    var summarySource: SummarySource = .extractive
+
+    enum SummarySource: String, Codable, Hashable {
+        /// Sentences lifted from the article by `Summarizer`.
+        case extractive
+        case claude
+    }
+
+    var hasSummary: Bool { tldr != nil || !keyPoints.isEmpty }
+
+    mutating func apply(_ summary: ClaudeSummarizer.Generated) {
+        tldr = summary.tldr.isEmpty ? nil : summary.tldr
+        keyPoints = summary.keyPoints
+        whyItMatters = summary.whyItMatters.isEmpty ? nil : summary.whyItMatters
+        summarySource = .claude
+    }
 
     var wordCount: Int {
         blocks.reduce(0) { total, block in

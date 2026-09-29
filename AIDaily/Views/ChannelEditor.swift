@@ -54,7 +54,7 @@ struct ChannelEditor: View {
             if isCompiling {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("Reading your prompt…")
+                    Text("Claude is reading your prompt…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -101,7 +101,7 @@ struct ChannelEditor: View {
             }
 
             HStack(spacing: 5) {
-                Image(systemName: compiler == .onDevice ? "sparkles" : "text.magnifyingglass")
+                Image(systemName: compiler.usesModel ? "sparkles" : "text.magnifyingglass")
                     .imageScale(.small)
                 Text(modelNote ?? "Matched with keyword rules.")
             }
@@ -251,36 +251,52 @@ struct ChannelEditor: View {
             return
         }
 
+        // Opening a saved channel assigns its prompt, which lands here too.
+        // Recompiling would bill a request and overwrite any hand-edited rules.
+        if let existing, text == existing.prompt, rules == existing.rules {
+            return
+        }
+
         // The keyword pass is instant, so show its result immediately rather
         // than leaving the sheet blank while the model thinks.
         rules = PromptCompiler.compile(text)
         compiler = .local
         suggestName(from: nil)
 
-        guard ModelPromptCompiler.isAvailable else {
-            modelNote = "Matched with keyword rules."
+        guard let client = AISettings.shared.client(for: .channels) else {
+            isCompiling = false
+            modelNote = AISettings.shared.hasKey
+                ? "Matched with keyword rules. Claude is turned off for channels in Settings."
+                : "Matched with keyword rules. Add an Anthropic API key in Settings for smarter channels."
             return
         }
 
         isCompiling = true
         compileTask = Task {
-            try? await Task.sleep(for: .milliseconds(600))
+            // Long enough that typing doesn't fire a request per word.
+            try? await Task.sleep(for: .milliseconds(900))
             guard !Task.isCancelled else { return }
 
-            let result = await ModelPromptCompiler.compile(text)
-            guard !Task.isCancelled else { return }
+            do {
+                let (result, usage) = try await ClaudeChannelCompiler.compile(text, client: client)
+                AISettings.shared.record(usage)
+                guard !Task.isCancelled else { return }
 
-            switch result {
-            case .success(let enhanced):
-                rules = enhanced.rules
-                compiler = .onDevice
-                modelNote = enhanced.addedTerms.isEmpty
-                    ? "Apple Intelligence reviewed this and had nothing to add."
-                    : "Apple Intelligence also added: \(enhanced.addedTerms.prefix(6).joined(separator: ", "))"
-                suggestName(from: enhanced.suggestedName)
-            case .failure(let reason):
+                if result.rules.include.isEmpty {
+                    modelNote = "Claude found nothing to match on. Using keyword rules."
+                } else {
+                    rules = result.rules
+                    compiler = .claude
+                    modelNote = "Rules written by \(client.model.label). Remove any term that doesn't belong."
+                    suggestName(from: result.name)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                let reason = (error as? ClaudeClient.Failure)?.message ?? error.localizedDescription
                 compiler = .local
-                modelNote = "\(reason.rawValue) Using keyword rules instead."
+                modelNote = "\(reason) Using keyword rules instead."
             }
             isCompiling = false
         }

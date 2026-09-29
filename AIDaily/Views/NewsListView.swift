@@ -133,7 +133,7 @@ struct NewsListView: View {
                 ForEach(store.channels) { channel in
                     chip(
                         title: channel.name,
-                        symbol: channel.compiler == .onDevice ? "sparkles" : "line.3.horizontal.decrease",
+                        symbol: channel.compiler.usesModel ? "sparkles" : "line.3.horizontal.decrease",
                         isOn: store.selectedChannelID == channel.id
                     ) {
                         store.selectedChannelID = store.selectedChannelID == channel.id ? nil : channel.id

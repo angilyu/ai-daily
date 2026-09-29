@@ -6,8 +6,11 @@ It pulls from 45 RSS feeds, extracts the full article text so you can read it
 without leaving the app, generates a short summary at the top of each piece, and
 lets you define your own channels by describing what you want in plain English.
 
-Written in SwiftUI. About 3,600 lines of Swift, no third-party dependencies, no
-API keys, and no server. Everything runs locally.
+Written in SwiftUI. About 4,400 lines of Swift, no third-party dependencies, and
+no server. The two jobs that need real language understanding — turning a
+channel prompt into rules, and summarizing articles — use **Claude** through your
+own Anthropic API key. Without a key, every feature still works with
+deterministic fallbacks.
 
 ---
 
@@ -16,7 +19,8 @@ API keys, and no server. Everything runs locally.
 - [What it does](#what-it-does)
 - [Architecture](#architecture)
 - [The readability extractor](#the-readability-extractor)
-- [The summarizer](#the-summarizer)
+- [Claude integration](#claude-integration)
+- [The summarizers](#the-summarizers)
 - [Prompt-defined channels](#prompt-defined-channels)
 - [Topic classification](#topic-classification)
 - [Refresh scheduling](#refresh-scheduling)
@@ -32,16 +36,17 @@ API keys, and no server. Everything runs locally.
 fetches the linked page and runs a hand-written readability extractor over the
 raw HTML to recover the actual prose, then renders it as native SwiftUI text.
 
-**Summarizes before you commit to reading.** Every article gets up to three
-bullet points at the top, in a collapsible card. This is extractive — it ranks
-and selects the article's own sentences rather than generating new text — so it
-cannot hallucinate.
+**Summarizes before you commit to reading.** Every article gets a card at the
+top with a one-line TL;DR, two to four key points with the concrete specifics
+(model names, parameter counts, benchmarks, prices), and a line on why it
+matters to engineers. Claude writes it; without a key, an extractive fallback
+lifts the article's own best sentences instead.
 
 **Filters by topic.** Each story is classified into one of six engineering
 buckets, shown as a badge and usable as a filter.
 
 **Channels you define by prompt.** Describe the news you want and the app
-compiles it into visible, editable keyword rules. See
+compiles it — with Claude — into visible, editable keyword rules. See
 [Prompt-defined channels](#prompt-defined-channels).
 
 **Lives in the menu bar too.** A `MenuBarExtra` shows recent headlines, and both
@@ -62,9 +67,15 @@ Feed (URL)
    └─ NewsStore ───────────── dedupe, merge, retention, persistence
         │
         ├─ ArticleLoader ──── fetch page → ArticleExtractor → Article
-        │                                    └─ Summarizer → keyPoints
-        │
-        └─ ChannelMatcher ─── score items against compiled ChannelRules
+        │                        ├─ Summarizer (extractive, instant)
+        │                        └─ ClaudeSummarizer (async, replaces it) ─┐
+        │                                                                  │
+        └─ ChannelMatcher ─── score items against ChannelRules             │
+                                  ▲                                        │
+             ChannelEditor ── PromptCompiler (instant)                     │
+                          └── ClaudeChannelCompiler (debounced) ───────────┤
+                                                                           ▼
+                             AISettings ── Keychain key ── ClaudeClient ── api.anthropic.com
 ```
 
 Layering is strict: `Models` hold data, `Services` do work and own all the
@@ -83,7 +94,7 @@ thread.
 | --- | --- |
 | `Feed` | A source. Name, URL, enabled flag, built-in flag. |
 | `NewsItem` | One story. Stable ID derived from its link, plus topics. |
-| `Article` | Extracted full text as `[ArticleBlock]` plus `keyPoints`. |
+| `Article` | Extracted full text as `[ArticleBlock]`, plus `tldr`, `keyPoints`, `whyItMatters`, and which summarizer wrote them. |
 | `Topic` | Six-case enum used for badges and filtering. |
 | `Channel` | A user prompt plus the `ChannelRules` it compiled into. |
 
@@ -138,9 +149,73 @@ resolve to a redirect page and never reach the article.
 
 ---
 
-## The summarizer
+## Claude integration
 
-`Summarizer.swift` ranks the article's own sentences and returns the best three.
+Claude is used for exactly two jobs — the ones where the deterministic versions
+measurably fell short — and nowhere else. Topic badges, matching, ranking,
+extraction, and refresh stay deterministic: they run per story, so they need to
+be instant, free, and predictable.
+
+| Job | Runs | Without a key |
+| --- | --- | --- |
+| Channel prompt → rules | Once per prompt edit, debounced 900ms | Keyword compiler |
+| Article summary | Once per article, cached to disk | Extractive summarizer |
+
+**Setup.** Settings → AI → paste an Anthropic API key. It's stored in the macOS
+Keychain, never in `UserDefaults` or the JSON store. *Test Connection* makes one
+tiny real request so a bad key fails in Settings rather than silently inside a
+channel. Each job has its own toggle, and a running counter estimates spend.
+
+**Model.** Claude Sonnet 5.5 by default; Haiku 4.5 and Opus 5.5 are selectable.
+Requests use `effort: low` (these are extraction tasks, not reasoning problems)
+and are omitted for Haiku, which doesn't support it.
+
+**Client** (`ClaudeClient.swift`, ~200 lines, no SDK). One method: send a system
+prompt, a user message, and a JSON schema; get back a decoded `Decodable`.
+[Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
+(`output_config.format`) constrain decoding to the schema, so there's no "the
+model wrapped the JSON in prose" failure mode. Every failure maps to a typed
+case — invalid key, rate limit, overloaded, refusal, truncation, offline,
+timeout — each with a readable message, and every caller falls back rather than
+surfacing a dead end.
+
+**The schema-order bug.** Schemas are passed as JSON *text*, not Swift
+dictionaries. The model fills fields in schema order, and `[String: Any]`
+serializes in random order. When `related` happened to come before `core` and
+`name`, the model returned `{"core":[],"exclude":[],"name":"","related":[]}` in
+**6 of 10** calls; in the intended order, **0 of 10**. This showed up in
+benchmarking as 5 of 15 prompts compiling to nothing, and was invisible from the
+Python client used for comparison because Python dicts preserve insertion order.
+There's also a single retry if a response still comes back empty.
+
+**Cost, measured.** $0.0026 per channel compile and $0.009 per article summary on
+Sonnet 5.5. Summaries are cached in `summaries.json` (capped at 1,500 entries),
+so reopening an article — or relaunching — never pays twice.
+
+**Privacy.** With a key set, article text and channel prompts are sent to
+Anthropic. Nothing else is: not your read history, feed list, or other channels.
+
+---
+
+## The summarizers
+
+### Claude (`ClaudeSummarizer.swift`)
+
+The article opens immediately with the extractive digest; Claude's summary
+replaces it in place when it arrives (p50 3.6s), with a *"Claude is
+summarizing…"* indicator in between. Reading never waits on the network. Up to
+24,000 characters of article text are sent — nearly every news post in full.
+Images are skipped and code blocks truncated.
+
+The prompt restricts Claude to facts stated in the article. Checked on eight
+live articles from eight different sources: **every one of the 58 numbers**
+Claude wrote into a summary appears verbatim in the source text. The old
+extractive digest, by comparison, often led with a side remark — for a
+LocalLLaMA benchmark post, its first point was about the comment section.
+
+### Extractive fallback (`Summarizer.swift`)
+
+Ranks the article's own sentences and returns the best three.
 Extractive, not generative, so a summary can never contain a claim the article
 doesn't make.
 
@@ -195,58 +270,55 @@ channel degrades into "less relevant last" instead of an empty list. A title hit
 counts triple a summary hit. Matching is whole-word, so `ram` doesn't fire on
 `program`. Exclusions are the one hard rule, because "not X" is explicit.
 
-**3. On-device model** (`ModelPromptCompiler.swift`) — optional enhancement via
-Apple's `FoundationModels` framework. Free, private, offline. Weak-linked, so
-the app still builds and runs on macOS 14 and 15 and simply reports the model as
-unavailable.
+**3. Claude** (`ClaudeChannelCompiler.swift`) — replaces the keyword rules
+when a key is set. The editor shows the keyword result instantly, then swaps in
+Claude's rules about two seconds later.
 
-It runs **once per prompt edit**, never per story. Judging 200 stories
-individually was measured at roughly 500ms each, so the architecture uses the
-model to compile rules once and then matches instantly and deterministically
-forever after.
+Claude returns a name and three lists: `core` terms (weight 3), `related` terms
+(weight 2), and `exclude`. The prompt pushes hard toward specific names that
+literally appear in headlines — `"running models on my macbook"` becomes
+`llama.cpp, mlx, ollama, gguf, apple silicon, m4`, not `local, models, laptop`.
 
-### What the on-device model actually does, measured
+Exclusions are kept, but guarded. Any exclusion that equals something the
+reader asked for — or is a fragment of it, like `silicon` inside `apple
+silicon` — is dropped, because exclusion is a hard filter and one bad term
+silently empties the channel. Negation parsed deterministically from the prompt
+is always kept.
 
-Two findings shaped the implementation.
+The model runs **once per prompt edit**, never per story. Matching stays
+instant and deterministic, and every term is visible and removable in the editor.
 
-**Its exclusion lists are unsafe.** Across real prompts:
+### Why Claude, measured
 
-| Prompt | Model's `exclude` output |
-| --- | --- |
-| `local llm inference on apple silicon` | `apple`, `silicon` |
-| `ai agents and tool use` | `ai`, `agent`, `tool` |
-| `new model releases from the big labs` | `model`, `releases` |
+An earlier version used Apple's on-device `FoundationModels` model for this
+layer. It was benchmarked on 15 prompts across 7 categories (literal, negation,
+inference, jargon, multi-constraint, ambiguous, out-of-domain) and then replaced.
+All numbers below come from the same prompts, scored with the same rubric, and
+matched against the same live corpus of ~690 stories.
 
-Because exclusion is a hard filter, each of these silently empties the channel
-it was meant to define. **The model's exclusions are discarded entirely.**
-Negation is parsed deterministically from the prompt instead. The schema still
-*asks* for exclusions, because asking measurably improves the quality of the
-`include` list it returns.
+| | Keyword only | On-device model | **Claude Sonnet 5.5** |
+| --- | --- | --- | --- |
+| Calls completed | — | 83% (62/75) | **100% (45/45)** |
+| Latency p50 / p95 | instant | 1.8s / 51s | **2.0s / 3.8s** |
+| Semantic recall of expected terms | — | 28% | **79%** |
+| Self-defeating exclusions | 0% | 35–40% | **0%** |
+| Same prompt twice → same terms (Jaccard) | 100% | 29% | **71%** |
+| Live corpus precision | 26% | 47% | **69%** |
+| Live corpus recall | 64% | 29% | **81%** |
+| Live corpus F1 | 28% | 23% | **68%** |
+| Cost per compile | free | free | $0.0026 |
 
-**It occasionally runs away.** Over 24 runs, 23 completed with a median of about
-600ms and a worst case of 1.1s. One looped until it exhausted the 4,096-token
-context window, taking 50 seconds. There is an 8-second deadline that falls back
-to keyword rules — well clear of any real response.
+The on-device model scored *below the keyword compiler on F1*: it swung between
+extremes — zero matches for `"running models on my macbook"`, 367 for `"gpu news
+but not gaming"`. Its signature failure was generating exactly the right
+vocabulary and then putting it in both the include and exclude lists. Claude
+brings `"running models on my macbook"` to 96% precision and 86% recall.
 
-Two smaller constraints, found earlier:
-
-- Forcing an array length with `@Guide(.count(n))` makes the model degenerate
-  into repeated filler. The schema requests unconstrained arrays and the alias
-  table does the broadening.
-- Refusals fire on ordinary technology headlines and are not reproducible
-  between runs. Every failure mode falls back rather than surfacing an error.
-
-Everything the model returns is filtered before use: terms are trimmed of
-bullets and quotes, dropped if longer than 40 characters or more than three
-words, and discarded if they duplicate what the keyword pass already found or
-consist only of stopwords.
-
-**Honest assessment:** across six test prompts the on-device model added between
-0 and 4 extra matches over the keyword compiler alone. Its clearest value is
-naming channels and contributing occasional vocabulary (`llms`, `chatbots`,
-`natural language processing`). A frontier cloud model would do this
-meaningfully better — and because all three layers emit the same
-`ChannelRules` format, adding one is a drop-in change rather than a rewrite.
+Relevance for the corpus metrics is judged against an independent per-prompt
+vocabulary, not either compiler's own terms. It's a proxy, and a strict one: for
+`"the chip war between the us and china"` only one story in the corpus hit the
+reference vocabulary, so every compiler's precision on that prompt looks near
+zero.
 
 ---
 
@@ -340,10 +412,10 @@ xcodebuild -scheme AIDaily -configuration Debug \
 open build/Build/Products/Debug/AIDaily.app
 ```
 
-The project targets macOS 14.0. `FoundationModels` is weak-linked and gated
-behind `#available(macOS 26.0, *)`, so on older systems the app runs normally
-and the model layer reports itself unavailable — the keyword compiler handles
-everything.
+The project targets macOS 14.0. To enable the Claude features, open
+**Settings → AI** and paste an Anthropic API key from
+[console.anthropic.com](https://console.anthropic.com/settings/keys). The app is
+fully usable without one.
 
 The Xcode project uses `PBXFileSystemSynchronizedRootGroup` (object version 77),
 so files added to the `AIDaily` directory are picked up automatically without
@@ -354,7 +426,7 @@ editing the project file.
 The services are deliberately free of UI dependencies, so they can be compiled
 into standalone Swift executables and run against real data — live feeds, real
 HTML, and the app's own persisted store. That's how the extractor, summarizer,
-classifier, scheduler, and prompt compiler were all validated: not against
+classifier, scheduler, prompt compilers, and Claude summarizer were all validated: not against
 fixtures, but against the actual pages and headlines they'd see in production.
 
 ---
@@ -371,7 +443,10 @@ fixtures, but against the actual pages and headlines they'd see in production.
 - **Slow blogs can go invisible.** Sources that post less than once a fortnight
   fall outside the retention window entirely. Keeping each source's most recent
   post regardless of age would fix this.
-- **Transcripts summarize poorly.** Extractive ranking assumes expository prose.
+- **Transcripts summarize poorly without a key.** Extractive ranking assumes
+  expository prose; Claude handles them fine.
+- **Claude features need network access and a paid API key.** Without either,
+  the app falls back silently to keyword rules and extractive summaries.
 - **A channel can only match what's already in your sources.** A prompt about a
   topic none of the feeds cover compiles fine and matches nothing. The editor
   says so explicitly rather than showing a blank list.

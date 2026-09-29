@@ -47,8 +47,8 @@ struct ReaderView: View {
                     case .idle, .loading:
                         loadingPlaceholder
                     case .loaded(let article):
-                        if !article.keyPoints.isEmpty {
-                            summaryCard(points: article.keyPoints)
+                        if article.hasSummary || loader.summaryStatus != .idle {
+                            summaryCard(for: article)
                         }
                         ForEach(article.blocks) { block in
                             view(for: block)
@@ -120,11 +120,21 @@ struct ReaderView: View {
         }
     }
 
-    private func summaryCard(points: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func summaryCard(for article: Article) -> some View {
+        let isGenerating = loader.summaryStatus == .generating
+
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 6) {
                 Image(systemName: "sparkles")
                 Text("The gist")
+                if isGenerating {
+                    ProgressView().controlSize(.mini)
+                    Text("Claude is summarizing…").fontWeight(.regular)
+                } else {
+                    Text(article.summarySource == .claude ? "· Summarized by Claude" : "· Key sentences from the article")
+                        .fontWeight(.regular)
+                        .foregroundStyle(.tertiary)
+                }
                 Spacer()
                 Button {
                     showSummary.toggle()
@@ -139,19 +149,62 @@ struct ReaderView: View {
             .foregroundStyle(.secondary)
 
             if showSummary {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(points, id: \.self) { point in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Circle()
-                                .fill(Color.accentColor.opacity(0.7))
-                                .frame(width: 5, height: 5)
-                                .offset(y: -2)
-                            Text(point)
-                                .font(.system(size: bodySize * 0.92))
-                                .lineSpacing(bodySize * 0.3)
-                                .fixedSize(horizontal: false, vertical: true)
+                if let tldr = article.tldr {
+                    Text(tldr)
+                        .font(.system(size: bodySize * 1.02, weight: .semibold))
+                        .lineSpacing(bodySize * 0.3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if !article.keyPoints.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(article.keyPoints, id: \.self) { point in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Circle()
+                                    .fill(Color.accentColor.opacity(0.7))
+                                    .frame(width: 5, height: 5)
+                                    .offset(y: -2)
+                                Text(point)
+                                    .font(.system(size: bodySize * 0.92))
+                                    .lineSpacing(bodySize * 0.3)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                     }
+                    .opacity(isGenerating ? 0.55 : 1)
+                } else if isGenerating {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(0..<3, id: \.self) { index in
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(.quaternary)
+                                .frame(height: bodySize * 0.7)
+                                .frame(maxWidth: index == 2 ? 260 : .infinity)
+                        }
+                    }
+                }
+
+                if let why = article.whyItMatters {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("Why it matters")
+                            .fontWeight(.semibold)
+                            .foregroundStyle(Color.accentColor)
+                        Text(why)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(.system(size: bodySize * 0.88))
+                    .lineSpacing(bodySize * 0.25)
+                    .padding(.top, 2)
+                }
+
+                if case .failed(let reason) = loader.summaryStatus {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle")
+                        Text("\(reason) Showing key sentences instead.")
+                        Button("Retry") { loader.retrySummary() }
+                            .buttonStyle(.link)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
             }
         }
@@ -163,6 +216,7 @@ struct ReaderView: View {
                 .frame(width: 3)
                 .clipShape(RoundedRectangle(cornerRadius: 2))
         }
+        .animation(.easeOut(duration: 0.2), value: article.summarySource)
     }
 
     @ViewBuilder

@@ -19,15 +19,20 @@ struct Channel: Identifiable, Codable, Hashable {
 enum CompilerKind: String, Codable, Hashable {
     case builtIn
     case local
+    /// Retired: kept so channels saved by earlier versions still decode.
     case onDevice
+    case claude
 
     var label: String {
         switch self {
         case .builtIn: "Built in"
         case .local: "Keyword rules"
         case .onDevice: "On-device model"
+        case .claude: "Claude"
         }
     }
+
+    var usesModel: Bool { self == .onDevice || self == .claude }
 }
 
 /// A term the user can see, reweight, or delete. Matching never reaches

@@ -12,9 +12,22 @@ final class ArticleLoader {
         case unavailable(String)
     }
 
+    enum SummaryStatus: Equatable {
+        case idle
+        case generating
+        case failed(String)
+    }
+
     private(set) var state: State = .idle
+    private(set) var summaryStatus: SummaryStatus = .idle
     private var cache: [String: Article] = [:]
     private var task: Task<Void, Never>?
+    private var summaryTask: Task<Void, Never>?
+    private var currentItem: NewsItem?
+
+    /// Below this there's nothing worth compressing; the reader sees it all
+    /// on one screen anyway.
+    private let minimumWordsForClaude = 150
 
     private let browserUserAgent = """
         Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -23,11 +36,15 @@ final class ArticleLoader {
 
     func load(_ item: NewsItem) {
         task?.cancel()
+        summaryTask?.cancel()
+        summaryStatus = .idle
+        currentItem = item
 
         if let cached = cache[item.id] {
             state = cached.isPartial
                 ? .unavailable("This site doesn't share the full article.")
                 : .loaded(cached)
+            if !cached.isPartial { enhanceSummary(cached, item: item) }
             return
         }
 
@@ -42,12 +59,68 @@ final class ArticleLoader {
             self.state = article.isPartial
                 ? .unavailable("This site doesn't share the full article.")
                 : .loaded(article)
+            if !article.isPartial { self.enhanceSummary(article, item: item) }
         }
     }
 
     func clear() {
         task?.cancel()
+        summaryTask?.cancel()
+        currentItem = nil
+        summaryStatus = .idle
         state = .idle
+    }
+
+    func retrySummary() {
+        guard let item = currentItem, let article = cache[item.id] else { return }
+        enhanceSummary(article, item: item)
+    }
+
+    // MARK: - Claude summary
+
+    /// The article renders immediately with the extractive digest; Claude's
+    /// summary replaces it in place when it arrives. Reading never waits on
+    /// the network.
+    private func enhanceSummary(_ article: Article, item: NewsItem) {
+        guard article.summarySource != .claude,
+              article.wordCount >= minimumWordsForClaude,
+              let client = AISettings.shared.client(for: .summaries)
+        else { return }
+
+        summaryStatus = .generating
+        summaryTask = Task { [weak self] in
+            if let cached = await SummaryCache.shared.summary(for: item.id) {
+                self?.install(cached, on: article, item: item)
+                return
+            }
+            do {
+                let (summary, usage) = try await ClaudeSummarizer.summarize(
+                    title: item.title,
+                    source: item.sourceName,
+                    article: article,
+                    client: client
+                )
+                AISettings.shared.record(usage)
+                await SummaryCache.shared.store(summary, for: item.id, model: client.model.rawValue)
+                guard !Task.isCancelled else { return }
+                self?.install(summary, on: article, item: item)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, let self, self.currentItem?.id == item.id else { return }
+                let failure = (error as? ClaudeClient.Failure)?.message ?? error.localizedDescription
+                self.summaryStatus = .failed(failure)
+            }
+        }
+    }
+
+    private func install(_ summary: ClaudeSummarizer.Generated, on article: Article, item: NewsItem) {
+        var updated = article
+        updated.apply(summary)
+        cache[item.id] = updated
+        guard currentItem?.id == item.id else { return }
+        state = .loaded(updated)
+        summaryStatus = .idle
     }
 
     // MARK: - Extraction
